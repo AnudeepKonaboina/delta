@@ -394,12 +394,14 @@ public class ColumnMapping {
 
   /**
    * For each column/field in a {@link Metadata}'s schema, assign an id using the current maximum id
-   * as the basis and increment from there. Additionally, assign a physical name based on a random
-   * UUID or re-use the old display name if the mapping mode is updated on an existing table. When
-   * `icebergWriterCompatV1` is enabled, we assign physical names as 'col-[colId]'.
+   * as the basis and increment from there. Additionally, assign a physical name that matches the
+   * logical field name to ensure compatibility with data files. When `icebergWriterCompatV1` or
+   * `icebergWriterCompatV3` is enabled, we assign physical names as 'col-[colId]'.
    *
    * @param metadata The new metadata to assign ids and physical names to
-   * @param isNewTable whether this is part of a commit that sets the mapping mode on a new table
+   * @param isNewTable whether this is part of a commit that sets the mapping mode on a new table.
+   *     Note: This parameter is kept for API compatibility but is no longer used in physical name
+   *     assignment.
    * @return Optional {@link Metadata} with a new schema where ids and physical names have been
    *     assigned if the schema has changed, returns Optional.empty() otherwise
    */
@@ -464,19 +466,19 @@ public class ColumnMapping {
 
   /**
    * Recursively visits each nested struct / array / map type and assigns an id using the current
-   * maximum id as the basis and increments from there. Additionally, assigns a physical name based
-   * on a random UUID or re-uses the old display name if the mapping mode is updated on an existing
-   * table. Note that key / value fields of a map and the element field of an array are not assigned
-   * an id / physical name. Such functionality is actually being handled by {@link
-   * ColumnMapping#rewriteFieldIdsForIceberg(StructType, AtomicInteger)}.
+   * maximum id as the basis and increments from there. Additionally, assigns a physical name that
+   * matches the logical field name to ensure compatibility with data files. Note that key / value
+   * fields of a map and the element field of an array are not assigned an id / physical name. Such
+   * functionality is actually being handled by {@link ColumnMapping#rewriteFieldIdsForIceberg(StructType,
+   * AtomicInteger)}.
    *
    * @param field The current {@link StructField}
    * @param maxColumnId Holds the current maximum id. Value is incremented whenever the current max
    *     id value is used to keep the current value always the max id
-   * @param isNewTable Whether this is a new or an existing table. For existing tables the physical
-   *     name will be re-used from the old display name
+   * @param isNewTable Whether this is a new or an existing table. Note: This parameter is kept for
+   *     API compatibility but is no longer used in physical name assignment.
    * @param useColumnIdForPhysicalName Whether we should assign physical names to 'col-[colId]'.
-   *     When false uses the default behavior described above.
+   *     When false, uses the logical field name as the physical name.
    * @return A new {@link StructField} with updated metadata under the {@link
    *     ColumnMapping#COLUMN_MAPPING_ID_KEY} and the {@link
    *     ColumnMapping#COLUMN_MAPPING_PHYSICAL_NAME_KEY} keys
@@ -524,16 +526,16 @@ public class ColumnMapping {
 
   /**
    * Assigns an id using the current maximum id as the basis and increments from there.
-   * Additionally, assigns a physical name based on a random UUID or re-uses the old display name if
-   * the mapping mode is updated on an existing table.
+   * Additionally, assigns a physical name that matches the logical field name to ensure
+   * compatibility with the schema in data files.
    *
    * @param field The current {@link StructField} to assign an id / physical name to
    * @param maxColumnId Holds the current maximum id. Value is incremented whenever the current max
    *     id value is used to keep the current value always the max id
-   * @param isNewTable Whether this is a new or an existing table. For existing tables the physical
-   *     name will be re-used from the old display name
+   * @param isNewTable Whether this is a new or an existing table. Note: This parameter is kept for
+   *     API compatibility but is no longer used in physical name assignment.
    * @param useColumnIdForPhysicalName Whether we should assign physical names to 'col-[colId]'.
-   *     When false uses the default behavior described above.
+   *     When false, uses the logical field name as the physical name.
    * @return A new {@link StructField} with updated metadata under the {@link
    *     ColumnMapping#COLUMN_MAPPING_ID_KEY} and the {@link
    *     ColumnMapping#COLUMN_MAPPING_PHYSICAL_NAME_KEY} keys
@@ -561,13 +563,15 @@ public class ColumnMapping {
                   .build());
     }
     if (!hasPhysicalName(field)) {
-      // re-use old display names as physical names when a table is updated
+      // Use logical field name as physical name for both new and existing tables.
+      // This ensures that physical column names in metadata match what's in data files.
       String physicalName;
       if (useColumnIdForPhysicalName) {
         long columnId = getColumnId(field);
         physicalName = String.format("col-%s", columnId);
       } else {
-        physicalName = isNewTable ? "col-" + UUID.randomUUID() : field.getName();
+        // Always use field.getName() to match the schema in Parquet files
+        physicalName = field.getName();
       }
 
       field =
