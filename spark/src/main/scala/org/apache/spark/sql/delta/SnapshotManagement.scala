@@ -935,14 +935,14 @@ trait SnapshotManagement { self: DeltaLog =>
     var attempt = 0
     var segment = initSegment
     // Remember the first error we hit. If all retries fail, we will throw the first error to
-    // provide the root cause. We catch `SparkException` because corrupt checkpoint files are
-    // detected in the executor side when a task is trying to read them.
-    var firstError: SparkException = null
+    // provide the root cause. We catch any Exception because corrupt checkpoint files can throw
+    // various exceptions (e.g., IOException, SparkException) when tasks try to read them.
+    var firstError: Exception = null
     while (true) {
       try {
         return snapshotCreator(segment)
       } catch {
-        case e: SparkException if attempt < numRetries && !segment.checkpointProvider.isEmpty =>
+        case e: Exception if attempt < numRetries && !segment.checkpointProvider.isEmpty =>
           if (firstError == null) {
             firstError = e
           }
@@ -957,7 +957,7 @@ trait SnapshotManagement { self: DeltaLog =>
               throw firstError
             }
           attempt += 1
-        case e: SparkException if firstError != null =>
+        case e: Exception if firstError != null =>
           logWarning(log"Failed to create a snapshot from log segment " +
             log"${MDC(DeltaLogKeys.LOG_SEGMENT, segment)}", e)
           throw firstError
