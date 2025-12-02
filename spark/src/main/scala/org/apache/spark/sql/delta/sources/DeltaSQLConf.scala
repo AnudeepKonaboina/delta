@@ -590,6 +590,24 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createOptional
 
+  val DELTA_VACUUM_PROGRESS_LOGGING_ENABLED =
+    buildConf("vacuum.progressLogging.enabled")
+      .internal()
+      .doc("When true, VACUUM periodically logs progress about file and directory listing " +
+        "approximately every 5 minutes while scanning the table for untracked files.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_VACUUM_PROGRESS_LOGGING_INTERVAL_MS =
+    buildConf("vacuum.progressLogging.intervalMillis")
+      .internal()
+      .doc("Controls how often VACUUM logs file and directory listing progress when " +
+        s"'${DELTA_VACUUM_PROGRESS_LOGGING_ENABLED.key}' is enabled. " +
+        "Intended for testing; production should rely on the default ~10 minute interval.")
+      .longConf
+      .checkValue(_ > 0, "vacuum.progressLogging.intervalMillis must be positive")
+      .createWithDefault(java.util.concurrent.TimeUnit.MINUTES.toMillis(10))
+
   val LITE_VACUUM_ENABLED =
     buildConf("vacuum.lite.enabled")
       .doc("Allows Vacuum to be run in Lite mode")
