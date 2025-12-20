@@ -147,135 +147,145 @@ public class ActiveAddFilesIterator implements CloseableIterator<FilteredColumna
     if (next.isPresent()) {
       return; // already have a next result
     }
-    if (!iter.hasNext()) {
-      return; // no next result, and no batches to read
-    }
 
-    final ActionWrapper _next = iter.next();
-    final ColumnarBatch addRemoveColumnarBatch = _next.getColumnarBatch();
-    final boolean isFromCheckpoint = _next.isFromCheckpoint();
+    // Keep consuming underlying batches until we find one with at least one active AddFile.
+    // If a batch contains zero active AddFiles, skip creating a FilteredColumnarBatch for it.
+    while (!next.isPresent() && iter.hasNext()) {
+      final ActionWrapper _next = iter.next();
+      final ColumnarBatch addRemoveColumnarBatch = _next.getColumnarBatch();
+      final boolean isFromCheckpoint = _next.isFromCheckpoint();
 
-    // Step 1: Update `tombstonesFromJson` with all the RemoveFiles in this columnar batch, if
-    //         and only if this batch is not from a checkpoint.
-    //
-    //         There's no reason to put a RemoveFile from a checkpoint into `tombstonesFromJson`
-    //         since, when we generate a checkpoint, any corresponding AddFile would have
-    //         been excluded already
-    if (!isFromCheckpoint) {
-      final ColumnVector removesVector =
-          addRemoveColumnarBatch.getColumnVector(REMOVE_FILE_ORDINAL);
-      for (int rowId = 0; rowId < removesVector.getSize(); rowId++) {
-        if (removesVector.isNullAt(rowId)) {
-          continue;
+      // Step 1: Update `tombstonesFromJson` with all the RemoveFiles in this columnar batch, if
+      //         and only if this batch is not from a checkpoint.
+      //
+      //         There's no reason to put a RemoveFile from a checkpoint into `tombstonesFromJson`
+      //         since, when we generate a checkpoint, any corresponding AddFile would have
+      //         been excluded already
+      if (!isFromCheckpoint) {
+        final ColumnVector removesVector =
+            addRemoveColumnarBatch.getColumnVector(REMOVE_FILE_ORDINAL);
+        for (int rowId = 0; rowId < removesVector.getSize(); rowId++) {
+          if (removesVector.isNullAt(rowId)) {
+            continue;
+          }
+
+          // Note: this row doesn't represent the complete RemoveFile schema. It only contains
+          //       the fields we need for this replay.
+          final String path = getRemoveFilePath(removesVector, rowId);
+          final URI pathAsUri = pathToUri(path);
+          final Optional<String> dvId =
+              Optional.ofNullable(getRemoveFileDV(removesVector, rowId))
+                  .map(DeletionVectorDescriptor::getUniqueId);
+          final UniqueFileActionTuple key = new UniqueFileActionTuple(pathAsUri, dvId);
+          tombstonesFromJson.add(key);
+          metrics.removeFilesFromDeltaFilesCounter.increment();
+        }
+      }
+
+      // Step 2: Iterate over all the AddFiles in this columnar batch in order to build up the
+      //         selection vector. We unselect an AddFile when it was removed by a RemoveFile
+      final ColumnVector addsVector = addRemoveColumnarBatch.getColumnVector(ADD_FILE_ORDINAL);
+      selectionVectorBuffer =
+          prepareSelectionVectorBuffer(selectionVectorBuffer, addsVector.getSize());
+      boolean atLeastOneUnselected = false;
+      int numActiveAddFilesInBatch = 0;
+
+      for (int rowId = 0; rowId < addsVector.getSize(); rowId++) {
+        if (addsVector.isNullAt(rowId)) {
+          atLeastOneUnselected = true;
+          continue; // selectionVector will be `false` at rowId by default
         }
 
-        // Note: this row doesn't represent the complete RemoveFile schema. It only contains
-        //       the fields we need for this replay.
-        final String path = getRemoveFilePath(removesVector, rowId);
+        metrics.addFilesCounter.increment();
+        if (!isFromCheckpoint) {
+          metrics.addFilesFromDeltaFilesCounter.increment();
+        }
+
+        final String path = getAddFilePath(addsVector, rowId);
         final URI pathAsUri = pathToUri(path);
         final Optional<String> dvId =
-            Optional.ofNullable(getRemoveFileDV(removesVector, rowId))
+            Optional.ofNullable(getAddFileDV(addsVector, rowId))
                 .map(DeletionVectorDescriptor::getUniqueId);
         final UniqueFileActionTuple key = new UniqueFileActionTuple(pathAsUri, dvId);
-        tombstonesFromJson.add(key);
-        metrics.removeFilesFromDeltaFilesCounter.increment();
+        final boolean alreadyDeleted = tombstonesFromJson.contains(key);
+        final boolean alreadyReturned = addFilesFromJson.contains(key);
+
+        boolean doSelect = false;
+
+        if (!alreadyReturned) {
+          // Note: No AddFile will appear twice in a checkpoint, so we only need
+          //       non-checkpoint AddFiles in the set. When stats are recomputed the same
+          //       AddFile is added with stats without remove it first.
+          if (!isFromCheckpoint) {
+            addFilesFromJson.add(key);
+          }
+
+          if (!alreadyDeleted) {
+            doSelect = true;
+            selectionVectorBuffer[rowId] = true;
+            numActiveAddFilesInBatch++;
+            metrics.activeAddFilesCounter.increment();
+          }
+        } else {
+          metrics.duplicateAddFilesCounter.increment();
+        }
+
+        if (!doSelect) {
+          atLeastOneUnselected = true;
+        }
       }
-    }
 
-    // Step 2: Iterate over all the AddFiles in this columnar batch in order to build up the
-    //         selection vector. We unselect an AddFile when it was removed by a RemoveFile
-    final ColumnVector addsVector = addRemoveColumnarBatch.getColumnVector(ADD_FILE_ORDINAL);
-    selectionVectorBuffer =
-        prepareSelectionVectorBuffer(selectionVectorBuffer, addsVector.getSize());
-    boolean atLeastOneUnselected = false;
-
-    for (int rowId = 0; rowId < addsVector.getSize(); rowId++) {
-      if (addsVector.isNullAt(rowId)) {
-        atLeastOneUnselected = true;
-        continue; // selectionVector will be `false` at rowId by default
+      // If there are no active AddFiles in this batch, skip creating a FilteredColumnarBatch.
+      // This prevents Scan#getScanFiles (and PaginatedScan#getScanFiles) from returning batches
+      // with zero selected rows.
+      if (numActiveAddFilesInBatch == 0) {
+        continue;
       }
 
-      metrics.addFilesCounter.increment();
+      ColumnarBatch scanAddFiles = addRemoveColumnarBatch;
+      // Step 3: Drop the RemoveFile column and use the selection vector to build a new
+      //         FilteredColumnarBatch
+      // For checkpoint files, we would only have read the adds, not the removes.
       if (!isFromCheckpoint) {
-        metrics.addFilesFromDeltaFilesCounter.increment();
+        scanAddFiles = scanAddFiles.withDeletedColumnAt(1);
       }
 
-      final String path = getAddFilePath(addsVector, rowId);
-      final URI pathAsUri = pathToUri(path);
-      final Optional<String> dvId =
-          Optional.ofNullable(getAddFileDV(addsVector, rowId))
-              .map(DeletionVectorDescriptor::getUniqueId);
-      final UniqueFileActionTuple key = new UniqueFileActionTuple(pathAsUri, dvId);
-      final boolean alreadyDeleted = tombstonesFromJson.contains(key);
-      final boolean alreadyReturned = addFilesFromJson.contains(key);
-
-      boolean doSelect = false;
-
-      if (!alreadyReturned) {
-        // Note: No AddFile will appear twice in a checkpoint, so we only need
-        //       non-checkpoint AddFiles in the set. When stats are recomputed the same
-        //       AddFile is added with stats without remove it first.
-        if (!isFromCheckpoint) {
-          addFilesFromJson.add(key);
-        }
-
-        if (!alreadyDeleted) {
-          doSelect = true;
-          selectionVectorBuffer[rowId] = true;
-          metrics.activeAddFilesCounter.increment();
-        }
-      } else {
-        metrics.duplicateAddFilesCounter.increment();
+      // Step 4: TODO: remove this step. This is a temporary requirement until the path
+      //         in `add` is converted to absolute path.
+      final ColumnarBatch finalScanAddFiles = scanAddFiles;
+      if (tableRootVectorGenerator == null) {
+        tableRootVectorGenerator =
+            wrapEngineException(
+                () ->
+                    engine
+                        .getExpressionHandler()
+                        .getEvaluator(
+                            finalScanAddFiles.getSchema(),
+                            Literal.ofString(tableRoot.toUri().toString()),
+                            StringType.STRING),
+                "Get the expression evaluator for the table root");
       }
-
-      if (!doSelect) {
-        atLeastOneUnselected = true;
-      }
-    }
-
-    ColumnarBatch scanAddFiles = addRemoveColumnarBatch;
-    // Step 3: Drop the RemoveFile column and use the selection vector to build a new
-    //         FilteredColumnarBatch
-    // For checkpoint files, we would only have read the adds, not the removes.
-    if (!isFromCheckpoint) {
-      scanAddFiles = scanAddFiles.withDeletedColumnAt(1);
-    }
-
-    // Step 4: TODO: remove this step. This is a temporary requirement until the path
-    //         in `add` is converted to absolute path.
-    final ColumnarBatch finalScanAddFiles = scanAddFiles;
-    if (tableRootVectorGenerator == null) {
-      tableRootVectorGenerator =
+      ColumnVector tableRootVector =
           wrapEngineException(
-              () ->
-                  engine
-                      .getExpressionHandler()
-                      .getEvaluator(
-                          finalScanAddFiles.getSchema(),
-                          Literal.ofString(tableRoot.toUri().toString()),
-                          StringType.STRING),
-              "Get the expression evaluator for the table root");
-    }
-    ColumnVector tableRootVector =
-        wrapEngineException(
-            () -> tableRootVectorGenerator.eval(finalScanAddFiles),
-            "Evaluating the table root expression");
-    scanAddFiles =
-        scanAddFiles.withNewColumn(
-            1, InternalScanFileUtils.TABLE_ROOT_STRUCT_FIELD, tableRootVector);
+              () -> tableRootVectorGenerator.eval(finalScanAddFiles),
+              "Evaluating the table root expression");
+      scanAddFiles =
+          scanAddFiles.withNewColumn(
+              1, InternalScanFileUtils.TABLE_ROOT_STRUCT_FIELD, tableRootVector);
 
-    Optional<ColumnVector> selectionColumnVector = Optional.empty();
-    if (atLeastOneUnselected) {
-      selectionColumnVector =
-          Optional.of(
-              wrapEngineException(
-                  () ->
-                      engine
-                          .getExpressionHandler()
-                          .createSelectionVector(selectionVectorBuffer, 0, addsVector.getSize()),
-                  "Create selection vector for selected scan files"));
+      Optional<ColumnVector> selectionColumnVector = Optional.empty();
+      if (atLeastOneUnselected) {
+        selectionColumnVector =
+            Optional.of(
+                wrapEngineException(
+                    () ->
+                        engine
+                            .getExpressionHandler()
+                            .createSelectionVector(selectionVectorBuffer, 0, addsVector.getSize()),
+                    "Create selection vector for selected scan files"));
+      }
+      next = Optional.of(new FilteredColumnarBatch(scanAddFiles, selectionColumnVector));
     }
-    next = Optional.of(new FilteredColumnarBatch(scanAddFiles, selectionColumnVector));
   }
 
   public static String getAddFilePath(ColumnVector addFileVector, int rowId) {

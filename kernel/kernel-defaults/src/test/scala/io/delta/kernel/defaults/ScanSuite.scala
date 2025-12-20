@@ -1390,6 +1390,33 @@ class ScanSuite extends AnyFunSuite with TestUtils
     }
   }
 
+  test("getScanFiles skips batches with zero active AddFiles") {
+    // Regression test for https://github.com/delta-io/delta/issues/4941
+    // When a table has no active AddFiles, Scan#getScanFiles should not emit a
+    // FilteredColumnarBatch with a selection vector that selects 0 rows.
+    withSQLConf(("spark.databricks.delta.properties.defaults.enableDeletionVectors", "false")) {
+      withTempDir { tempDir =>
+        spark.range(10).repartition(1).write.format("delta").save(tempDir.getCanonicalPath)
+        spark.sql(s"DELETE FROM delta.`${tempDir.getCanonicalPath}` WHERE true")
+
+        val scan =
+          Table.forPath(defaultEngine, tempDir.getCanonicalPath)
+            .getLatestSnapshot(defaultEngine)
+            .getScanBuilder()
+            .build()
+
+        val scanFiles = scan.getScanFiles(defaultEngine)
+        try {
+          assert(
+            !scanFiles.hasNext,
+            "Expected zero scan-file batches when there are no active files")
+        } finally {
+          scanFiles.close()
+        }
+      }
+    }
+  }
+
   test("don't read stats column when there is no usable data skipping filter") {
     val path = goldenTablePath("data-skipping-basic-stats-all-types")
     val engine = engineDisallowedStatsReads
