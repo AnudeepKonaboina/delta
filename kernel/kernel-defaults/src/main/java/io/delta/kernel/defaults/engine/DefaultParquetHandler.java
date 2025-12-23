@@ -47,6 +47,11 @@ public class DefaultParquetHandler implements ParquetHandler {
   }
 
   @Override
+  public Optional<Set<String>> getParquetFileFieldNames(FileStatus fileStatus) throws IOException {
+    return Optional.of(new ParquetFileReader(fileIO).getFieldNames(fileStatus));
+  }
+
+  @Override
   public CloseableIterator<FileReadResult> readParquetFiles(
       CloseableIterator<FileStatus> fileIter,
       StructType physicalSchema,

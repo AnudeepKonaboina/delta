@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Provides Parquet file related functionalities to Delta Kernel. Connectors can leverage this
@@ -38,6 +39,18 @@ import java.util.Optional;
  */
 @Evolving
 public interface ParquetHandler {
+  /**
+   * Optionally return the set of top-level field names present in the Parquet file schema.
+   *
+   * <p>This is primarily intended for validations (e.g., column mapping / physical name checks) and
+   * should be implemented efficiently by reading only Parquet metadata (footer), not data pages.
+   *
+   * <p>Engines that cannot provide this information may return {@link Optional#empty()}.
+   */
+  default Optional<Set<String>> getParquetFileFieldNames(FileStatus fileStatus) throws IOException {
+    return Optional.empty();
+  }
+
   /**
    * Read the Parquet format files at the given locations and return the data as a {@link
    * ColumnarBatch} with the columns requested by {@code physicalSchema}.

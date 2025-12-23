@@ -58,6 +58,23 @@ public class ParquetFileReader {
     checkArgument(maxBatchSize > 0, "invalid Parquet reader batch size: %s", maxBatchSize);
   }
 
+  /**
+   * Return the set of top-level Parquet field names present in the given file by reading only the
+   * Parquet footer metadata.
+   */
+  public Set<String> getFieldNames(FileStatus fileStatus) throws IOException {
+    InputFile inputFile = fileIO.newInputFile(fileStatus.getPath(), fileStatus.getSize());
+    org.apache.parquet.io.InputFile parquetInputFile =
+        ParquetIOUtils.createParquetInputFile(inputFile);
+    ParquetMetadata footer =
+        org.apache.parquet.hadoop.ParquetFileReader.readFooter(
+            parquetInputFile, ParquetMetadataConverter.NO_FILTER);
+    MessageType schema = footer.getFileMetaData().getSchema();
+    Set<String> names = new HashSet<>();
+    schema.getFields().forEach(t -> names.add(t.getName()));
+    return names;
+  }
+
   public CloseableIterator<ColumnarBatch> read(
       FileStatus fileStatus, StructType schema, Optional<Predicate> predicate) {
 

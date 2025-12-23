@@ -65,6 +65,7 @@ import io.delta.kernel.metrics.TransactionReport;
 import io.delta.kernel.types.StructType;
 import io.delta.kernel.utils.CloseableIterable;
 import io.delta.kernel.utils.CloseableIterator;
+import io.delta.kernel.utils.FileStatus;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.*;
@@ -543,6 +544,9 @@ public class TransactionImpl implements Transaction {
 
       boolean isAppendOnlyTable = APPEND_ONLY_ENABLED.fromMetadata(metadata);
 
+      final ColumnMapping.ColumnMappingMode columnMappingMode =
+          ColumnMapping.getColumnMappingMode(metadata.getConfiguration());
+
       // Create a new CloseableIterator that will return the metadata actions followed by the
       // data actions.
       CloseableIterator<Row> dataAndMetadataActions =
@@ -550,6 +554,15 @@ public class TransactionImpl implements Transaction {
               .combine(completeFileActionIter)
               .map(
                   action -> {
+                    if (columnMappingMode != ColumnMapping.ColumnMappingMode.NONE
+                        && !action.isNullAt(ADD_FILE_ORDINAL)) {
+                      AddFile addFile = new AddFile(action.getStruct(ADD_FILE_ORDINAL));
+                      try {
+                        validateAddFileForColumnMapping(engine, columnMappingMode, addFile);
+                      } catch (IOException ioe) {
+                        throw new UncheckedIOException(ioe);
+                      }
+                    }
                     incrementMetricsForFileActionRow(transactionMetrics, action);
                     if (!action.isNullAt(REMOVE_FILE_ORDINAL)) {
                       RemoveFile removeFile = new RemoveFile(action.getStruct(REMOVE_FILE_ORDINAL));
@@ -655,6 +668,65 @@ public class TransactionImpl implements Transaction {
       long removeFileSize =
           removeFile.getSize().orElseThrow(DeltaErrorsInternal::missingRemoveFileSizeDuringCommit);
       txnMetrics.updateForRemoveFile(removeFileSize);
+    }
+  }
+
+  /**
+   * Validates that the committed parquet file was written using physical column names.
+   *
+   * <p>In "name" mode, table schema assigns stable physical column names
+   * (delta.columnMapping.physicalName) and readers resolve by those names.
+   *
+   * <p>This validation is best-effort and requires engine support to read Parquet metadata.
+   *
+   * <p>If the Engine can’t do that, then the Engine will refuse to commit the file.
+   *
+   * <p>If the Engine can do that, then the Engine will fail the commit with an
+   * UnsupportedOperationException when the file is written using logical column names.
+   */
+  private void validateAddFileForColumnMapping(
+      Engine engine, ColumnMapping.ColumnMappingMode columnMappingMode, AddFile addFile)
+      throws IOException {
+
+    Path fullPath = new Path(dataPath, addFile.getPath());
+    String resolved = engine.getFileSystemClient().resolvePath(fullPath.toString());
+    FileStatus fileStatus = engine.getFileSystemClient().getFileStatus(resolved);
+
+    Optional<Set<String>> parquetFieldNamesOpt =
+        engine.getParquetHandler().getParquetFileFieldNames(fileStatus);
+    if (!parquetFieldNamesOpt.isPresent()) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "Cannot validate Parquet schema for external file `%s` being committed to a table "
+                  + "with column mapping enabled (mode=%s). "
+                  + "The Delta Kernel Engine cannot read the source Parquet schema and refuses "
+                  + "to commit this file. "
+                  + "Target table requires physical column names (property `%s`).",
+              resolved, columnMappingMode, ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY));
+    }
+
+    Map<String, String> logicalToPhysical = new HashMap<>();
+    for (io.delta.kernel.types.StructField f : metadata.getSchema().fields()) {
+      if (f.getMetadata().contains(ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY)) {
+        logicalToPhysical.put(f.getName(), ColumnMapping.getPhysicalName(f));
+      }
+    }
+
+    for (String name : parquetFieldNamesOpt.get()) {
+      String expectedPhysical = logicalToPhysical.get(name);
+      if (expectedPhysical != null && !expectedPhysical.equals(name)) {
+        throw new UnsupportedOperationException(
+            String.format(
+                "Column mapping is enabled on this Delta table (mode=%s). "
+                    + "Parquet file `%s` contains logical column `%s` but the table expects "
+                    + "physical column `%s`. "
+                    + "Write Parquet using physical column names from `%s`.",
+                columnMappingMode,
+                resolved,
+                name,
+                expectedPhysical,
+                ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY));
+      }
     }
   }
 
