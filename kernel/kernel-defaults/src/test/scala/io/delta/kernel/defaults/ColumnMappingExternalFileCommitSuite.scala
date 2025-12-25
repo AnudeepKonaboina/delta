@@ -117,8 +117,9 @@ trait ColumnMappingExternalFileCommitSuiteBase extends AnyFunSuite with Abstract
             engine,
             inMemoryIterable(toCloseableIterator(Seq(actionRow).asJava.iterator())))
         }
-        assert(e.getMessage.contains("Column mapping is enabled"))
-        assert(e.getMessage.contains("expects physical column"))
+        val msg = e.getMessage.toLowerCase
+        assert(msg.contains("column mapping is enabled"))
+        assert(msg.contains("expects physical column"))
       }
 
       // Good file should succeed (file uses the physical column name).

@@ -672,7 +672,7 @@ public class TransactionImpl implements Transaction {
   }
 
   /**
-   * Validates that the committed parquet file was written using physical column names.
+   * Validates whether the parquet file to commit matches physical column names of the delta table
    *
    * <p>In "name" mode, table schema assigns stable physical column names
    * (delta.columnMapping.physicalName) and readers resolve by those names.
@@ -697,7 +697,7 @@ public class TransactionImpl implements Transaction {
     if (!parquetFieldNamesOpt.isPresent()) {
       throw new UnsupportedOperationException(
           String.format(
-              "Cannot validate Parquet schema for external file `%s` being committed to a table "
+              "Cannot validate parquet schema for external file `%s` being committed to a table "
                   + "with column mapping enabled (mode=%s). "
                   + "The Delta Kernel Engine cannot read the source Parquet schema and refuses "
                   + "to commit this file. "
@@ -705,27 +705,21 @@ public class TransactionImpl implements Transaction {
               resolved, columnMappingMode, ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY));
     }
 
-    Map<String, String> logicalToPhysical = new HashMap<>();
+    Map<String, String> logicalToPhysicalColMap = new HashMap<>();
     for (io.delta.kernel.types.StructField f : metadata.getSchema().fields()) {
       if (f.getMetadata().contains(ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY)) {
-        logicalToPhysical.put(f.getName(), ColumnMapping.getPhysicalName(f));
+        logicalToPhysicalColMap.put(f.getName(), ColumnMapping.getPhysicalName(f));
       }
     }
 
     for (String name : parquetFieldNamesOpt.get()) {
-      String expectedPhysical = logicalToPhysical.get(name);
+      String expectedPhysical = logicalToPhysicalColMap.get(name);
       if (expectedPhysical != null && !expectedPhysical.equals(name)) {
         throw new UnsupportedOperationException(
             String.format(
-                "Column mapping is enabled on this Delta table (mode=%s). "
-                    + "Parquet file `%s` contains logical column `%s` but the table expects "
-                    + "physical column `%s`. "
-                    + "Write Parquet using physical column names from `%s`.",
-                columnMappingMode,
-                resolved,
-                name,
-                expectedPhysical,
-                ColumnMapping.COLUMN_MAPPING_PHYSICAL_NAME_KEY));
+                "Parquet file `%s` contains logical column `%s` but the table expects "
+                    + "physical column `%s` since column mapping is enabled on this Delta table. ",
+                resolved, name, expectedPhysical));
       }
     }
   }
