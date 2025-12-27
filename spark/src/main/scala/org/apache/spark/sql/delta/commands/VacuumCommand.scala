@@ -329,6 +329,73 @@ object VacuumCommand extends VacuumCommandImpl with Serializable {
                 "Shouldn't have any absolute paths for deletion here.")
               pathToUrlEncodedString(DeltaFileOperations.absolutePath(basePath, relativePath))
             }
+
+          val deleteOutsideTableEnabled = spark.sessionState.conf.getConf(
+            DeltaSQLConf.DELTA_VACUUM_DELETE_OUTSIDE_TABLE_ENABLED)
+          val allowedOutsidePrefixesRaw = spark.sessionState.conf.getConf(
+            DeltaSQLConf.DELTA_VACUUM_DELETE_OUTSIDE_TABLE_ALLOWED_PREFIXES)
+          val allowedOutsidePrefixes =
+            Option(allowedOutsidePrefixesRaw)
+              .getOrElse("")
+              .split(",")
+              .map(_.trim)
+              .filter(_.nonEmpty)
+              .toSeq
+
+          val outsideTableTombstonesToDelete = if (deleteOutsideTableEnabled) {
+            require(
+              allowedOutsidePrefixes.nonEmpty,
+              s"VACUUM outside-table deletes are enabled but no allowlist is configured. " +
+                s"Set `${DeltaSQLConf.DELTA_VACUUM_DELETE_OUTSIDE_TABLE_ALLOWED_PREFIXES.key}`.")
+
+            val confDriver = hadoopConf.value.value
+            val allowedOutsidePrefixUris: Seq[URI] = allowedOutsidePrefixes.map { prefix =>
+              val prefixPath = new Path(prefix)
+              val prefixFs = prefixPath.getFileSystem(confDriver)
+              prefixFs.makeQualified(prefixPath).toUri
+            }
+
+            val baseUri = new Path(basePath).toUri
+            snapshot.stateDS
+              .mapPartitions { actions =>
+                val conf = hadoopConf.value.value
+                actions.flatMap {
+                  _.unwrap match {
+                    case tombstone: RemoveFile if tombstone.delTimestamp < deleteBeforeTimestamp =>
+                      val p = urlEncodedStringToPath(tombstone.path)
+                      if (!p.isAbsolute) {
+                        Nil
+                      } else {
+                        val fileFs = p.getFileSystem(conf)
+                        val qualifiedPath = fileFs.makeQualified(p)
+                        val fileUri = qualifiedPath.toUri
+
+                        val isUnderTableRoot =
+                          fileUri.getScheme == baseUri.getScheme &&
+                            Option(fileUri.getAuthority).getOrElse("") ==
+                              Option(baseUri.getAuthority).getOrElse("") &&
+                            Option(fileUri.getPath).getOrElse("").startsWith(
+                              Option(baseUri.getPath).getOrElse("") + "/")
+
+                        if (!isUnderTableRoot) {
+                          val allowed = allowedOutsidePrefixUris.exists { prefixUri =>
+                            fileUri.getScheme == prefixUri.getScheme &&
+                              Option(fileUri.getAuthority).getOrElse("") ==
+                                Option(prefixUri.getAuthority).getOrElse("") &&
+                              Option(fileUri.getPath).getOrElse("").startsWith(
+                                Option(prefixUri.getPath).getOrElse(""))
+                          }
+                          if (allowed) Seq(pathToUrlEncodedString(qualifiedPath)) else Nil
+                        } else Nil
+                      }
+                    case _ => Nil
+                  }
+                }
+              }
+              .distinct()
+          } else {
+            spark.emptyDataset[String]
+          }
           val timeTakenToIdentifyEligibleFiles =
             System.currentTimeMillis() - startTimeToIdentifyEligibleFiles
 
@@ -361,7 +428,10 @@ object VacuumCommand extends VacuumCommandImpl with Serializable {
               log"a total of ${MDC(DeltaLogKeys.NUM_DIRS, dirCounts)} directories " +
               log"that are safe to delete. Vacuum stats: ${MDC(DeltaLogKeys.VACUUM_STATS, stats)}")
 
-            return diffFiles.map(f => urlEncodedStringToPath(f).toString).toDF("path")
+            val allCandidates =
+              if (deleteOutsideTableEnabled) diffFiles.union(outsideTableTombstonesToDelete)
+              else diffFiles
+            return allCandidates.map(f => urlEncodedStringToPath(f).toString).toDF("path")
           }
           logVacuumStart(
             spark,
@@ -373,8 +443,23 @@ object VacuumCommand extends VacuumCommandImpl with Serializable {
 
           val deleteStartTime = System.currentTimeMillis()
           val filesDeleted = try {
-            delete(diffFiles, spark, basePath,
-              hadoopConf, parallelDeleteEnabled, parallelDeletePartitions)
+            val deletedInsideTable = delete(
+              diffFiles,
+              spark,
+              basePath,
+              hadoopConf,
+              parallelDeleteEnabled,
+              parallelDeletePartitions)
+            val deletedOutsideTable = if (deleteOutsideTableEnabled) {
+              deleteOutsideTable(
+                outsideTableTombstonesToDelete,
+                hadoopConf,
+                parallelDeleteEnabled,
+                parallelDeletePartitions)
+            } else {
+              0L
+            }
+            deletedInsideTable + deletedOutsideTable
           } catch {
             case t: Throwable =>
               logVacuumEnd(spark, table, commandMetrics = commandMetrics)
@@ -670,6 +755,40 @@ trait VacuumCommandImpl extends DeltaCommand {
       val fs = new Path(basePath).getFileSystem(hadoopConf.value.value)
       val fileResultSet = diff.toLocalIterator().asScala
       fileResultSet.map(p => urlEncodedStringToPath(p)).count(f => tryDeleteNonRecursive(fs, f))
+    }
+  }
+
+  /**
+   * Attempts to delete the list of candidate files where file paths may live outside the Delta
+   * table root directory. The file system is resolved per file path.
+   */
+  protected def deleteOutsideTable(
+      diff: Dataset[String],
+      hadoopConf: Broadcast[SerializableConfiguration],
+      parallel: Boolean,
+      parallelPartitions: Int): Long = {
+    import org.apache.spark.sql.delta.implicits._
+
+    if (parallel) {
+      diff.repartition(parallelPartitions).mapPartitions { files =>
+        val conf = hadoopConf.value.value
+        val filesDeletedPerPartition = files
+          .map(p => urlEncodedStringToPath(p))
+          .count { path =>
+            val fs = path.getFileSystem(conf)
+            tryDeleteNonRecursive(fs, path)
+          }
+        Iterator(filesDeletedPerPartition)
+      }.collect().sum
+    } else {
+      val conf = hadoopConf.value.value
+      val fileResultSet = diff.toLocalIterator().asScala
+      fileResultSet
+        .map(p => urlEncodedStringToPath(p))
+        .count { path =>
+          val fs = path.getFileSystem(conf)
+          tryDeleteNonRecursive(fs, path)
+        }
     }
   }
 

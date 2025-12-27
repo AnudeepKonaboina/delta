@@ -619,6 +619,29 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .checkValue(_ > 0, "parallelDelete.parallelism must be positive")
       .createOptional
 
+  val DELTA_VACUUM_DELETE_OUTSIDE_TABLE_ENABLED =
+    buildConf("vacuum.deleteOutsideTable.enabled")
+      .internal()
+      .doc(
+        """When enabled, VACUUM may delete eligible tombstoned files (RemoveFile actions older than
+          |the retention threshold) even when the data files live outside the Delta table root
+          |directory. This is an unsafe operation unless combined with an allowlist (see
+          |spark.databricks.delta.vacuum.deleteOutsideTable.allowedPrefixes).
+          |""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
+  val DELTA_VACUUM_DELETE_OUTSIDE_TABLE_ALLOWED_PREFIXES =
+    buildConf("vacuum.deleteOutsideTable.allowedPrefixes")
+      .internal()
+      .doc(
+        """Comma-separated list of URI prefixes that VACUUM is allowed to delete when
+          |spark.databricks.delta.vacuum.deleteOutsideTable.enabled is true.
+          |Example: file:/tmp/external/, s3://bucket/prefix/
+          |""".stripMargin)
+      .stringConf
+      .createWithDefault("")
+
   val ENFORCE_DELETED_FILE_AND_LOG_RETENTION_DURATION_COMPATIBILITY =
     buildConf("vacuum.enforceDeletedFileAndLogRetentionDurationCompatibility")
       .internal()
