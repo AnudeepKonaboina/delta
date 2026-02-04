@@ -248,6 +248,20 @@ class DeltaTableBuilderSuite
     assert(e.getMessage.contains("The data type of the column `value` was not provided"))
   }
 
+  test("DeltaTable.forName exposes table comment set by DeltaTableBuilder") {
+    withTable("tbl_with_comment") {
+      io.delta.tables.DeltaTable.create(spark)
+        .tableName("tbl_with_comment")
+        .addColumn("id", "int")
+        .comment("my table comment")
+        .execute()
+
+      val loaded = io.delta.tables.DeltaTable.forName(spark, "tbl_with_comment")
+      assert(loaded.tableComment.contains("my table comment"))
+      assert(loaded.getTableComment == "my table comment")
+    }
+  }
+
   testCreateTable("create_table") { table =>
     defaultCreateTableBuilder(ifNotExists = false, Some(table)).execute()
   }

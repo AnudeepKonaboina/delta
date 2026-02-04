@@ -89,6 +89,29 @@ class DeltaTable private[tables](
   def toDF: Dataset[Row] = df
 
   /**
+   * :: Evolving ::
+   *
+   * Get the table comment/description for this Delta table, if it was set at table creation time.
+   *
+   * Note that this value is stored in Delta table metadata (transaction log) and is available for
+   * both path-based and catalog-managed Delta tables.
+   *
+   * @since 4.1.0
+   */
+  @Evolving
+  def tableComment: Option[String] = Option(deltaLog.snapshot.metadata.description)
+
+  /**
+   * Java-friendly accessor for {@link #tableComment}.
+   *
+   * @return table comment/description, or null if none is set
+   *
+   * @since 4.1.0
+   */
+  @Evolving
+  def getTableComment: String = tableComment.orNull
+
+  /**
    * Recursively delete files and directories in the table that are not needed by the table for
    * maintaining older versions up to the given retention threshold. This method will return an
    * empty DataFrame on successful completion.
