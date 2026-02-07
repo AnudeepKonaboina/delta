@@ -59,7 +59,9 @@ setup(
     ],
     keywords='delta.io',
     package_dir={'': 'python'},
-    packages=['delta', 'delta.connect', 'delta.connect.proto'],
+    # Include delta.exceptions (added in 4.0 for Delta Connect exception types).
+    # This fixes delta-io/delta#5370 where the published wheel missed delta.exceptions.
+    packages=['delta', 'delta.connect', 'delta.connect.proto', 'delta.exceptions'],
     package_data={
         'delta': ['py.typed'],
     },
