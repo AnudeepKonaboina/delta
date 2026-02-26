@@ -36,8 +36,9 @@ import org.apache.spark.SparkContext
 import org.apache.spark.sql.{Column, DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, If, Literal}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, Not}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.delta.DeltaOperations.Operation
@@ -131,6 +132,34 @@ case class UpdateCommand(
     val numFilesTotal = txn.snapshot.numOfFiles
 
     val updateCondition = condition.getOrElse(Literal.TrueLiteral)
+
+    // Optimization: skip "no-op updates" (rows where updated values are identical to existing
+    // values) to avoid unnecessary file rewrites / deletion vectors.
+    //
+    // We enable this only when potentially-changing update expressions are deterministic and do
+    // not contain subqueries, to avoid changing semantics for non-deterministic updates.
+    val potentiallyChangingUpdates = updateExpressions.zip(target.output).filterNot {
+      case (update, original) => update.semanticEquals(original)
+    }
+    if (potentiallyChangingUpdates.isEmpty) {
+      // Entire UPDATE is a no-op (e.g. SET col = col). Avoid any file rewrites / DV work.
+      return
+    }
+
+    val canFilterNoopRows = potentiallyChangingUpdates.forall { case (expr, _) =>
+      expr.deterministic && !SubqueryExpression.hasSubquery(expr)
+    }
+
+    // Only rows matching `effectiveCondition` are considered "updated".
+    val effectiveCondition: Expression = if (canFilterNoopRows) {
+      val allUpdatedColsEqual = potentiallyChangingUpdates
+        .map { case (update, original) => EqualNullSafe(update, original) }
+        .reduceOption(And)
+        .getOrElse(TrueLiteral)
+      And(updateCondition, Not(allUpdatedColsEqual))
+    } else {
+      updateCondition
+    }
     val (metadataPredicates, dataPredicates) =
       DeltaTableUtils.splitMetadataAndDataPredicates(
         updateCondition, txn.metadata.partitionColumns, sparkSession)
@@ -149,7 +178,7 @@ case class UpdateCommand(
       // Case 1: Do nothing if no row qualifies the partition predicates
       // that are part of Update condition
       Nil
-    } else if (dataPredicates.isEmpty) {
+    } else if (dataPredicates.isEmpty && !canFilterNoopRows) {
       // Case 2: Update all the rows from the files that are in the specified partitions
       // when the data filter is empty
       candidateFiles
@@ -177,7 +206,7 @@ case class UpdateCommand(
           deltaLog,
           targetDf,
           fileIndex,
-          updateCondition,
+          effectiveCondition,
           opName = "UPDATE")
       } else {
         // Case 3.2: Find all the affected files using the non-DV path
@@ -188,7 +217,7 @@ case class UpdateCommand(
         val incrUpdatedCountExpr = IncrementMetric(TrueLiteral, metrics("numUpdatedRows"))
         val pathsToRewrite =
           withStatusCode("DELTA", UpdateCommand.FINDING_TOUCHED_FILES_MSG) {
-            data.filter(Column(updateCondition))
+            data.filter(Column(effectiveCondition))
               .select(input_file_name())
               .filter(Column(incrUpdatedCountExpr))
               .distinct()
@@ -208,10 +237,12 @@ case class UpdateCommand(
     }
 
     val totalActions = {
+      val fullPartitionUpdateWithoutScan = dataPredicates.isEmpty && !canFilterNoopRows
+
       // When DV is on, we first mask removed rows with DVs and generate (remove, add) pairs.
       val actionsForExistingFiles = if (shouldWriteDeletionVectors) {
         // When there's no data predicate, all matched files are removed.
-        if (dataPredicates.isEmpty) {
+        if (fullPartitionUpdateWithoutScan) {
           val operationTimestamp = System.currentTimeMillis()
           filesToRewrite.map(_.fileLogEntry.removeWithTimestamp(operationTimestamp))
         } else {
@@ -249,7 +280,7 @@ case class UpdateCommand(
               rootPath = tahoeFileIndex.path,
               inputLeafFiles = filesToRewrite.map(_.fileLogEntry),
               nameToAddFileMap = nameToAddFile,
-              condition = updateCondition,
+              condition = effectiveCondition,
               generateRemoveFileActions = !shouldWriteDeletionVectors,
               copyUnmodifiedRows = !shouldWriteDeletionVectors)
           } else {

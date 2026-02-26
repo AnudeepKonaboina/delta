@@ -44,6 +44,49 @@ trait UpdateSQLMixin extends UpdateBaseMixin
 trait UpdateSQLTests extends UpdateSQLMixin {
   import testImplicits._
 
+  test("UPDATE skips no-op updates (SET col = col)") {
+    withTable("tbl") {
+      Seq((1, 10), (2, 20)).toDF("key", "value").write.format("delta").saveAsTable("tbl")
+      val log = DeltaLog.forTable(spark, TableIdentifier("tbl"))
+      val v0 = log.update().version
+
+      // Entire update is a no-op; should not rewrite files or advance the log.
+      sql("UPDATE tbl SET value = value")
+      val v1 = log.update().version
+      assert(v0 === v1)
+
+      checkAnswer(spark.table("tbl").select("key", "value"), Seq(Row(1, 10), Row(2, 20)))
+    }
+  }
+
+  test("UPDATE skips no-op rows for deterministic updates") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      val log = DeltaLog.forTable(spark, path)
+
+      // All rows already have value=5.
+      Seq((1, 5), (2, 5), (3, 5)).toDF("key", "value").write.format("delta").save(path)
+      val v0 = log.update().version
+
+      // Previously this would rewrite the whole table when dataPredicates is empty.
+      executeUpdate(s"delta.`$path`", "value = 5")
+      val v1 = log.update().version
+
+      // We allow either no commit or a metadata-only commit, but must not rewrite files.
+      if (v1 > v0) {
+        val fileActions = log.getChanges(v1).flatMap(_._2)
+          .collect { case f: FileAction => f }
+          .toSeq
+        assert(fileActions.collect { case _: AddFile => 1 }.sum === 0)
+        assert(fileActions.collect { case _: RemoveFile => 1 }.sum === 0)
+      }
+
+      checkAnswer(
+        spark.read.format("delta").load(path).select("key", "value"),
+        Seq(Row(1, 5), Row(2, 5), Row(3, 5)))
+    }
+  }
+
   test("explain") {
     append(Seq((2, 2)).toDF("key", "value"))
     val df = sql(s"EXPLAIN UPDATE $tableSQLIdentifier SET key = 1, value = 2 WHERE key = 2")
